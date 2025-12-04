@@ -1,4 +1,5 @@
 # 导入必要的模块
+import locale
 import os
 import sys
 import subprocess
@@ -59,12 +60,38 @@ class AutoUnzipApp:
 
         # 加载密码文件
         if os.path.exists(self.passwords_file_path):
-            with open(self.passwords_file_path, 'r') as f:
-                # 读取密码文件中的所有非空行并去除首尾空格
-                self.passwords = [line.strip() for line in f if line.strip()]
-                self.log(f'加载 {len(self.passwords)} 个密码,{self.passwords}')
+            # 定义尝试的编码列表，优先使用UTF-8，其次是系统默认编码和GBK
+            encodings = ['utf-8', locale.getpreferredencoding(), 'gbk']
+            for encoding in encodings:
+                try:
+                    # 尝试使用当前编码打开并读取密码文件
+                    with open(self.passwords_file_path, 'r', encoding=encoding) as f:
+                        # 读取所有非空行作为密码列表
+                        self.passwords = [line.strip() for line in f if line.strip()]
+                    # 成功读取后记录日志并退出循环
+                    self.log(f'成功使用 {encoding} 编码加载 {len(self.passwords)} 个密码: {self.passwords}')
+                    break
+                except UnicodeDecodeError:
+                    # 如果当前编码解码失败，尝试下一个编码
+                    continue
+                except Exception as e:
+                    # 如果发生其他错误，记录日志并退出循环
+                    self.log(f'使用 {encoding} 编码加载密码文件时出错: {e}')
+                    break
+            else:
+                # 如果所有编码都尝试失败，清空密码列表并记录日志
+                self.passwords = []
+                self.log('所有编码尝试失败，无法加载密码文件')
         else:
-            self.log('未找到密码文件passwords.txt')
+            # 如果密码文件不存在，创建空的密码文件
+            with open(self.passwords_file_path, 'w', encoding='utf-8') as f:
+                f.write('')
+            # 创建示例密码文件
+            with open(os.path.join(self.get_exe_dir(), 'passwords_example.txt'), 'w', encoding='utf-8') as f:
+                f.write('666\n888\n嘿嘿嘿\n')
+            # 记录日志提示用户如何配置密码文件
+            self.log('未找到密码文件passwords.txt，已创建空文件')
+            self.log('请参考passwords_example.txt中的示例在passwords.txt中每行添加一个密码')
 
         # 启动指定数量的工作线程
         for _ in range(self.max_workers):
@@ -77,7 +104,11 @@ class AutoUnzipApp:
         if len(sys.argv) > 1:
             for file_path in sys.argv[1:]:
                 self.add_task(file_path)
-    
+        else:
+            self.log("请将文件拖到文件图标上使用")
+            self.window.after(1000, self.window.destroy)
+
+
     def get_7z_path(self):
         # 获取7z可执行文件的路径
         if getattr(sys, 'frozen', False):
@@ -102,11 +133,6 @@ class AutoUnzipApp:
         # 生成随机临时目录名
         chars = string.ascii_lowercase + string.digits
         return self.temp_dir_prefix + ''.join(random.choices(chars, k=5))
-    
-    def generate_temp_file(self, name):
-        # 生成随机临时文件名
-        chars = string.ascii_lowercase + string.digits
-        return self.temp_dir_prefix + ''.join(random.choices(chars, k=5)) + '_' + name
 
     def check_log_queue(self):
         # 检查日志队列并更新日志显示
@@ -173,7 +199,6 @@ class AutoUnzipApp:
                 self.log(f'找到目录: {os.path.basename(current_path)}')
                 continue
             original_name = os.path.basename(current_path)  # 获取原始文件名
-            success = False
             if self.is_compressed_file(current_path):
                 # 如果是压缩文件
                 self.log(f'检测到压缩文件: {original_name}')
@@ -305,16 +330,10 @@ class AutoUnzipApp:
                 for name in dirs + files:
                     try:
                         filename = os.path.join('.', name)  # 目标文件路径
-                        if os.path.exists(filename):
-                            # 如果文件已存在
-                            self.log(f'文件已存在: {filename}, 已添加为 tmp_随机_'+name)
-                            filename = os.path.join('.', self.generate_temp_file(name))  # 生成新的文件名
-                            self.log(f'新文件名: {filename}')
-                        # 将临时目录中的文件移动到当前目录
                         os.rename(os.path.join(root, name), filename)
                         extracted_files.append(filename)
                     except Exception as e:
-                        self.log(f'重命名文件失败: {str(e)}')
+                        self.log(f'移动文件失败: {str(e)}')
             shutil.rmtree(temp_dir)  # 删除临时目录
             return extracted_files
         except Exception as e:
