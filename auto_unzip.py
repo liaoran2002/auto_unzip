@@ -132,6 +132,37 @@ def volume_info(name):
     return None
 
 
+# 用来从文件名里剥掉"压缩包扩展名 / 分卷后缀",得到干净的"包名"
+_EXT_TAIL = re.compile(
+    r'\.(7z|zip|rar|tar|gz|tgz|bz2|tbz2|xz|txz|zst|tzst|cab)$', re.IGNORECASE)
+_VOL_TAIL = re.compile(r'(\.\d{3,}|\.part\d+|\.r\d{2,}|\.z\d{2,})$', re.IGNORECASE)
+
+
+def archive_stem(name):
+    """把 'big.7z.001' / 'a.part1.rar' / 'pack.7z' 都规整成干净的包名。
+
+    用于"解压出多个条目时,建一个与压缩包同名的文件夹"。
+    """
+    stem = name
+    # 先剥分卷序号,再剥压缩扩展名,可能嵌套(如 x.7z.001 要先去掉 .001)
+    for _ in range(3):
+        before = stem
+        stem = _VOL_TAIL.sub('', stem)
+        stem = _EXT_TAIL.sub('', stem)
+        if stem == before:
+            break
+    return stem or name
+
+
+def _human(n):
+    """把字节数变成好看的单位,用于日志提示。"""
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if abs(n) < 1024 or unit == 'TB':
+            return f'{n:.1f} {unit}' if unit != 'B' else f'{int(n)} B'
+        n /= 1024.0
+    return f'{n:.1f} PB'
+
+
 class AutoUnzipApp:
     def __init__(self):
         # 线程间传递日志
@@ -145,7 +176,7 @@ class AutoUnzipApp:
         self.move_lock = threading.RLock()
 
         # ---- 可调参数 ----
-        self.max_attempts = 20            # 单个输入最多连续解压多少层
+        self.max_attempts = 10            # 最多连续解压多少层(防畸形包无限套娃)
         self.max_workers = 4              # 工作线程数
         self.temp_dir_prefix = 'tmp_'
         self.extract_timeout = 1800       # 单次 7z 调用的超时(秒)
@@ -157,8 +188,16 @@ class AutoUnzipApp:
         self.progress_interval_ms = 120   # 进度条刷新间隔(毫秒)
         self.progress_stall_s = 300       # 多久没进度就认为卡住(秒)
 
+        # ---- 包炸弹(zip bomb)防护 ----
+        # 用 7z 的列表模式先读元数据,在真正解压之前判断。
+        self.bomb_guard = True
+        self.max_unpacked_bytes = 20 * 1024 ** 3   # 解压后总大小上限 20 GB
+        self.max_expand_ratio = 200                # 压缩比上限(解压后/压缩包)
+        self.max_entries = 200000                  # 条目数上限
+        self.min_free_bytes = 2 * 1024 ** 3        # 至少保留 2 GB 空闲空间
+
         # ---- 状态 ----
-        self.active_tasks = 0
+        self.active_tasks = 0        # 已入队但还没处理完的顶层任务数
         self.process_count = 0
         self.passwords = []
         self.seven_zip = None
@@ -173,6 +212,15 @@ class AutoUnzipApp:
         self.progress_lock = threading.Lock()
         self._progress = {}
         self._progress_seq = 0
+        # 正在解压的压缩包数(含嵌套子包),以及待解压的子包数。
+        # 状态栏用它显示真实进度,而不是"顶层任务槽位"。
+        # _outstanding = 已知的、还没处理完的压缩包总数。
+        #   * 入队时 +1(顶层任务和递归发现的子包都算)
+        #   * 每个包处理完(无论成功、失败、跳过)时 -1
+        # 于是:  解压中 = len(_progress),
+        #        排队   = _outstanding - 解压中
+        # 这样不需要单独记"子包队列",也不会出现计数泄漏。
+        self._outstanding = 0
 
         # ---- 界面 ----
         self.window = tk.Tk()
@@ -417,10 +465,26 @@ class AutoUnzipApp:
         self.log_queue.put(message)
 
     def update_status(self):
+        """状态栏显示真实的进度数字。
+
+        早期版本显示的是"顶层任务槽位数",会误导:
+          * 文件夹里 6 个包、4 个线程时显示 6,既不是"在解压的 4",
+            也不是"排队的 2";
+          * 嵌套子包完全不算(数字一直是 1);
+          * 收尾时进度行已清空,状态栏还挂着旧数字。
+
+        现在只用一个 _outstanding 计数推两个量,避免多计数互相打架:
+          解压中 = 此刻真正在跑的包;
+          排队   = 已知还没处理完的 - 在跑的。
+        """
         with self.lock:
             count = self.process_count
-            active = self.active_tasks
-        self.status_label.config(text=f'解压次数: {count}    待处理: {active}')
+        with self.progress_lock:
+            extracting = len(self._progress)
+            outstanding = self._outstanding
+        queued = max(0, outstanding - extracting)
+        self.status_label.config(
+            text=f'解压次数: {count}    解压中: {extracting}    排队: {queued}')
 
     def check_log_queue(self):
         drained = 0
@@ -594,81 +658,144 @@ class AutoUnzipApp:
         """
         file_queue = queue.Queue()
         file_queue.put((os.path.abspath(initial_path), 0))
+        with self.progress_lock:
+            self._outstanding += 1
         visited = set()
         processed = 0
         max_depth = 0
 
-        while not file_queue.empty():
-            current_path, depth = file_queue.get()
-            if current_path in visited:
-                continue
-            visited.add(current_path)
-            max_depth = max(max_depth, depth)
+        try:
+            while not file_queue.empty():
+                current_path, depth = file_queue.get()
+                if current_path in visited:
+                    continue
+                visited.add(current_path)
+                max_depth = max(max_depth, depth)
 
-            if os.path.isdir(current_path):
-                # 目录:扫出里面的压缩包。它们和命令行传入的包同级(深度不变)。
-                for found in self._archives_in_dir(current_path):
-                    file_queue.put((found, depth))
-                continue
+                if os.path.isdir(current_path):
+                    # 目录:扫出里面的压缩包。它们和命令行传入的包同级(深度不变)。
+                    children = self._archives_in_dir(current_path)
+                    with self.progress_lock:
+                        self._outstanding += len(children)
+                    for found in children:
+                        file_queue.put((found, depth))
+                    # 目录本身不是一个"待解压的包",从总数里去掉它
+                    self._settle_one()
+                    continue
 
-            # 用户可能直接拖来一个非首卷(.002/.r01),7z 打不开,
-            # 这里自动换成同组的首卷再解。
-            current_path = self._resolve_first_volume(current_path)
+                # 用户可能直接拖来一个非首卷(.002/.r01),7z 打不开,
+                # 这里自动换成同组的首卷再解。
+                current_path = self._resolve_first_volume(current_path)
 
-            kind = self.classify(current_path)
-            if kind is None:
-                continue
+                kind = self.classify(current_path)
+                if kind is None:
+                    self._settle_one()
+                    continue
 
-            if kind == 'rar' and not self.rar_capable:
-                self.log(f'跳过 RAR(当前引擎不支持): {os.path.basename(current_path)}')
-                self.log('  请把完整版 7-Zip 的 7z.exe 和 7z.dll 放到本程序同目录;')
-                self.log('  原文件已保留,不会被删除。')
-                continue
+                if kind == 'rar' and not self.rar_capable:
+                    self.log(f'跳过 RAR(当前引擎不支持): {os.path.basename(current_path)}')
+                    self.log('  请把完整版 7-Zip 的 7z.exe 和 7z.dll 放到本程序同目录;')
+                    self.log('  原文件已保留,不会被删除。')
+                    self._settle_one()
+                    continue
 
-            if kind == 'polyglot':
-                self.log(f'检测到图种(文件里含压缩包): {os.path.basename(current_path)}')
-            elif kind == 'volume':
-                self.log(f'检测到分卷(非首卷,将改用首卷): '
-                         f'{os.path.basename(current_path)}')
-            else:
-                self.log(f'检测到压缩包[{kind}]: {os.path.basename(current_path)}')
-            success, created, used_pwd = self.extract_archive(current_path)
-            if not success:
-                self.log(f'未能解压(原文件保留): {os.path.basename(current_path)}')
-                continue
+                if kind == 'polyglot':
+                    self.log(f'检测到图种(文件里含压缩包): {os.path.basename(current_path)}')
+                elif kind == 'volume':
+                    self.log(f'检测到分卷(非首卷,将改用首卷): '
+                             f'{os.path.basename(current_path)}')
+                else:
+                    self.log(f'检测到压缩包[{kind}]: {os.path.basename(current_path)}')
+                success, created, used_pwd = self.extract_archive(current_path)
+                self._settle_one()
+                if not success:
+                    self.log(f'未能解压(原文件保留): {os.path.basename(current_path)}')
+                    continue
 
-            processed += 1
-            # 嵌套层数到上限就不再往里钻(防畸形包无限套娃)
-            if depth + 1 >= self.max_attempts:
-                continue
-            # 递归条件(按需求):
-            #   a) 解压结果里只有"一个"压缩包 -> 继续解;
-            #   b) 解压结果是一组分卷(001/r01 加若干分包)-> 继续解。
-            # 其他情况(混着普通文件、多个互不相关的包)就停在这里,
-            # 避免把用户原本放在目录里的压缩包也一并解掉。
-            for item in self._recurse_targets(created):
-                file_queue.put((item, depth + 1))
+                processed += 1
+                # 嵌套层数上限:只为防止"包中包无限套娃"/自解压炸弹,
+                # 正常资源包很少超过十几层。到上限时明确告警,
+                # 不要静默停下(否则用户会以为"解压不完整"却查不到原因)。
+                if depth + 1 >= self.max_attempts:
+                    self.log(f'已连续解压 {depth + 1} 层,达到嵌套上限 '
+                             f'({self.max_attempts} 层),不再深入: '
+                             f'{os.path.basename(current_path)}')
+                    self.log('  如果确认还要继续解,可以调大 max_attempts 后重试。')
+                    continue
+                # 递归条件(按需求):
+                #   a) 解压结果里只有"一个"压缩包 -> 继续解;
+                #   b) 解压结果是一组分卷(001/r01 加若干分包)-> 继续解。
+                # 其他情况(混着普通文件、多个互不相关的包)就停在这里,
+                # 避免把用户原本放在目录里的压缩包也一并解掉。
+                targets = self._recurse_targets(created)
+                if targets:
+                    with self.progress_lock:
+                        self._outstanding += len(targets)
+                    for item in targets:
+                        file_queue.put((item, depth + 1))
+        finally:
+            # 兜底:万一中途抛异常,别把计数留在半空,否则状态栏永远不归零
+            while not file_queue.empty():
+                try:
+                    file_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._settle_one()
 
         self.log(f'完成: {os.path.basename(initial_path)}'
                  f'(共解压 {processed} 个包,最深嵌套 {max_depth} 层)')
 
+    def _settle_one(self):
+        """一个包处理完了(成功/失败/跳过都算),从"未完成"里扣掉一个。"""
+        with self.progress_lock:
+            self._outstanding = max(0, self._outstanding - 1)
+
     def _recurse_targets(self, created):
         """判断本次解压结果是否该继续解,返回要入队的压缩包列表。
 
-        只有两种情况继续:
+        会继续往里解的情况:
           * 结果里恰好一个压缩包;
+          * 结果里恰好一个文件夹,且该文件夹(递归)里**全是压缩包**;
           * 结果是一组分卷(同一词干 + 同一分卷类型)。
+
+        "只有一个文件夹且里面全是压缩包"这一条是按实际场景补的:
+        很多资源包解开后就是一个目录,目录里才是真正的分卷/压缩包集合。
+        但要求"全是压缩包":只要混进普通文件,说明这是最终内容而不是中转层,
+        就停下,免得把用户本来放在那儿的包也一起解掉。
         """
+        top_files = [i for i in created if os.path.isfile(i)]
+        top_dirs = [i for i in created if os.path.isdir(i)]
+
+        # created 里既有顶层条目,也有 _merge_move 递归时加进去的子项。
+        # 判断"本次解压产出了什么结构"只能看**最外层**,所以把
+        # 位于某个 top_dir 内部的项目过滤掉。
+        def _is_inside_top_dir(path):
+            for d in top_dirs:
+                try:
+                    if os.path.commonpath([os.path.abspath(d),
+                                           os.path.abspath(path)]) == os.path.abspath(d) \
+                            and os.path.abspath(path) != os.path.abspath(d):
+                        return True
+                except (ValueError, OSError):
+                    continue
+            return False
+
+        top_files = [i for i in top_files if not _is_inside_top_dir(i)]
+        top_dirs = [d for d in top_dirs if not _is_inside_top_dir(d)]
+
+        # ---- 情况 c:只有"一个"最外层文件夹 -> 看里面是否全是压缩包 ----
+        if len(top_dirs) == 1 and not top_files:
+            return self._all_archives_under(top_dirs[0])
+
         archives = []
         others = 0
-        for item in created:
-            if os.path.isfile(item):
-                if self.classify(item):
-                    archives.append(item)
-                else:
-                    others += 1
+        for item in top_files:
+            if self.classify(item):
+                archives.append(item)
             else:
                 others += 1
+        # 顶层还混着文件夹 -> 不算干净的中转层,不继续
+        others += len(top_dirs)
 
         if not archives:
             return []
@@ -688,6 +815,26 @@ class AutoUnzipApp:
                 first = self._first_volume(next(iter(groups.values())))
                 return [first] if first else []
         return []
+
+    def _all_archives_under(self, directory):
+        """若 directory 里(递归)每个文件都是压缩包,返回这些压缩包;
+        只要混入普通文件或空目录,就返回 [] —— 表示"这不是中转层"。
+        """
+        archives = []
+        for root, dirs, files in os.walk(directory):
+            for name in dirs:
+                try:
+                    if not os.listdir(os.path.join(root, name)):
+                        return []          # 有空的子目录,结构不单纯
+                except OSError:
+                    return []
+            for name in files:
+                full = os.path.join(root, name)
+                if self.classify(full):
+                    archives.append(full)
+                else:
+                    return []              # 混了普通文件 -> 是最终内容
+        return archives
 
     @staticmethod
     def _first_volume(paths):
@@ -742,20 +889,47 @@ class AutoUnzipApp:
         base = os.path.basename(archive_path)
         task_id = self._begin_progress(base)
         try:
+            # 解压包炸弹防护:先读元数据,预判解压后的大小/文件数,
+            # 超过阈值或磁盘装不下就直接放弃(此时一个字节都还没写盘)。
+            verdict = self._check_bomb(archive_path, base)
+            if verdict is not None:
+                self.log(f'拒绝解压(疑似包炸弹): {base}')
+                self.log(f'  原因: {verdict}')
+                self.log('  原文件已保留。如确认安全,可调大对应的 *_limit 参数。')
+                return False, set(), None
+
             used_pwd, ok = self._try_passwords(archive_path, tmp_dir, base, task_id)
             if not ok:
                 return False, set(), None
 
             created = set()
             failed = []
+            items = sorted(os.listdir(tmp_dir))
+
+            # ---- 决定"放哪" ----
+            # 解压出多个条目 -> 建一个与压缩包同名的文件夹收纳,
+            # 避免一堆同名/散乱文件直接摊在用户目录里;
+            # 只有一个条目      -> 直接放出来,不额外套一层壳。
+            if len(items) > 1:
+                dest_dir = os.path.join(target_dir, archive_stem(base))
+                try:
+                    with self.move_lock:
+                        os.makedirs(dest_dir, exist_ok=True)
+                except OSError as e:
+                    self.log(f'创建目录失败({dest_dir}): {e},改为放回原目录')
+                    dest_dir = target_dir
+                self.log(f'解压出 {len(items)} 项,归入文件夹: '
+                         f'{os.path.basename(dest_dir)}')
+            else:
+                dest_dir = target_dir
+
             # 7z 报的 0-100% 只覆盖"解压"这一段,后面还要把文件搬出临时目录。
             # 所以进度条切成两段:0-80% 解压、80-100% 搬运,
             # 免得文件多时进度条在搬运阶段一动不动。
-            items = sorted(os.listdir(tmp_dir))
             total_items = max(1, len(items))
             for index, name in enumerate(items):
                 self._merge_move(os.path.join(tmp_dir, name),
-                                 target_dir, created, failed)
+                                 dest_dir, created, failed)
                 moving_pct = 80 + int((index + 1) * 20 / total_items)
                 self._set_progress(moving_pct, f'{base} [搬移文件]', task_id)
 
@@ -779,6 +953,88 @@ class AutoUnzipApp:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             self._end_progress(task_id)
+
+    # ------------------------------------------------------------------
+    # 包炸弹防护
+    # ------------------------------------------------------------------
+    def _check_bomb(self, archive_path, base):
+        """解压前用 7z 的列表模式预判,危险就返回原因字符串,安全返回 None。
+
+        针对"压缩包炸弹":小体积压缩包解压出超大体积/超多文件,足以写满磁盘
+        或拖死系统。这里在真正写盘之前就拦下。
+
+        判断依据(任一命中即拒绝):
+          1. 解压后总大小超过 max_unpacked_bytes;
+          2. 压缩比超过 max_expand_ratio(小包解出巨大体积);
+          3. 条目数超过 max_entries;
+          4. 目标盘剩余空间装不下(留 min_free_bytes 余量)。
+        """
+        if not self.bomb_guard or not self.seven_zip:
+            return None
+
+        info = self._read_archive_info(archive_path)
+        if info is None:
+            # 读不到元数据(例如加密包需要密码):不做判断,交给正常解压流程,
+            # 仍然有超时/卡死保护兜底。
+            return None
+        total, count = info
+
+        try:
+            packed = os.path.getsize(archive_path)
+        except OSError:
+            packed = 0
+
+        if total > self.max_unpacked_bytes:
+            return (f'解压后约 {_human(total)},超过上限 '
+                    f'{_human(self.max_unpacked_bytes)}')
+        # 注意:上限为 0 表示"不允许任何多文件",不能因为 0 是假值就跳过检查
+        if self.max_entries is not None and count > self.max_entries:
+            return f'内含 {count} 个文件,超过上限 {self.max_entries}'
+        if packed > 0 and total > packed * self.max_expand_ratio:
+            ratio = total / packed
+            return (f'压缩比约 {ratio:.0f}:1,超过上限 '
+                    f'{self.max_expand_ratio}:1(压缩包 {_human(packed)} '
+                    f'-> 解压后 {_human(total)})')
+        # 磁盘空间
+        try:
+            free = shutil.disk_usage(os.path.dirname(archive_path)).free
+        except OSError:
+            free = None
+        if free is not None and total + self.min_free_bytes > free:
+            return (f'需要约 {_human(total)},但目标盘只剩 {_human(free)}'
+                    f'(需保留 {_human(self.min_free_bytes)} 余量)')
+        return None
+
+    def _read_archive_info(self, archive_path):
+        """用 7z l 读 (解压后总字节数, 条目数);读不到返回 None。
+
+        'l' 只读元数据,不解压,所以很安全也很快(不依赖扩展名)。
+        """
+        kwargs = {}
+        flag = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        if flag:
+            kwargs['creationflags'] = flag
+        try:
+            r = subprocess.run([self.seven_zip, 'l', '-slt', archive_path],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               timeout=self.scan_timeout, **kwargs)
+        except Exception:
+            return None
+        text = (r.stdout or b'').decode('utf-8', 'replace')
+        if r.returncode != 0:
+            return None
+        total = 0
+        count = 0
+        for line in text.splitlines():
+            if line.startswith('Size = '):
+                try:
+                    total += int(line[7:].strip())
+                except ValueError:
+                    pass
+                count += 1
+        if total <= 0 and count == 0:
+            return None
+        return total, count
 
     def _make_temp_dir(self, target_dir):
         """在目标目录(同盘)建临时目录;不行就退回系统临时目录。
